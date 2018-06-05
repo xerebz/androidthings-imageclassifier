@@ -16,8 +16,15 @@
 package com.example.androidthings.imageclassifier;
 
 import android.app.Activity;
+import android.content.Context;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
+import android.graphics.Color;
+import android.hardware.Sensor;
+import android.hardware.SensorEvent;
+import android.hardware.SensorEventListener;
+import android.hardware.SensorManager;
+import android.media.ImageReader;
 import android.os.Bundle;
 import android.util.Log;
 import android.view.KeyEvent;
@@ -26,12 +33,21 @@ import android.widget.ImageView;
 import android.widget.TextView;
 
 import com.example.androidthings.imageclassifier.classifier.Recognition;
+import com.example.androidthings.imageclassifier.classifier.TensorFlowHelper;
+import com.google.android.things.contrib.driver.bmx280.Bmx280SensorDriver;
 import com.google.android.things.contrib.driver.button.ButtonInputDriver;
 import com.google.android.things.contrib.driver.rainbowhat.RainbowHat;
+import com.squareup.picasso.Picasso;
+
+import org.tensorflow.lite.Interpreter;
 
 import java.io.IOException;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
 
 public class ImageClassifierActivity extends Activity {
     private static final String TAG = "ImageClassifierActivity";
@@ -50,26 +66,41 @@ public class ImageClassifierActivity extends Activity {
     private static final String MODEL_FILE = "mobilenet_quant_v1_224.tflite";
 
     private ButtonInputDriver mButtonDriver;
+    private Bmx280SensorDriver mSensorDriver;
     private boolean mProcessing;
 
     private ImageView mImage;
     private TextView mResultText;
 
-    // TODO: ADD ARTIFICIAL INTELLIGENCE
-    // TODO: ADD CAMERA SUPPORT
+    private CameraHandler mCameraHandler;
+    private ImagePreprocessor mImagePreprocessor;
+
+    private Interpreter mTensorFlowLite;
+    private List<String> mLabels;
+
+    private SensorManager mSensorManager;
+
+    private float mPressure;
+    private float mTemperature;
 
     /**
      * Initialize the classifier that will be used to process images.
      */
     private void initClassifier() {
-        // TODO: ADD ARTIFICIAL INTELLIGENCE
+        try {
+            mTensorFlowLite =
+                    new Interpreter(TensorFlowHelper.loadModelFile(this, MODEL_FILE));
+            mLabels = TensorFlowHelper.readLabels(this, LABELS_FILE);
+        } catch (IOException e) {
+            Log.w(TAG, "Unable to initialize TensorFlow Lite.", e);
+        }
     }
 
     /**
      * Clean up the resources used by the classifier.
      */
     private void destroyClassifier() {
-        // TODO: ADD ARTIFICIAL INTELLIGENCE
+        mTensorFlowLite.close();
     }
 
     /**
@@ -83,8 +114,25 @@ public class ImageClassifierActivity extends Activity {
      *              and power consuming.
      */
     private void doRecognize(Bitmap image) {
-        // TODO: ADD ARTIFICIAL INTELLIGENCE
-        Collection<Recognition> results = null;
+        // Allocate space for the inference results
+        byte[][] confidencePerLabel = new byte[1][mLabels.size()];
+        // Allocate buffer for image pixels.
+        int[] intValues = new int[TF_INPUT_IMAGE_WIDTH * TF_INPUT_IMAGE_HEIGHT];
+        ByteBuffer imgData = ByteBuffer.allocateDirect(
+                DIM_BATCH_SIZE * TF_INPUT_IMAGE_WIDTH * TF_INPUT_IMAGE_HEIGHT * DIM_PIXEL_SIZE);
+        imgData.order(ByteOrder.nativeOrder());
+
+        // Read image data into buffer formatted for the TensorFlow model
+        TensorFlowHelper.convertBitmapToByteBuffer(image, intValues, imgData);
+
+        // Run inference on the network with the image bytes in imgData as input,
+        // storing results on the confidencePerLabel array.
+        mTensorFlowLite.run(imgData, confidencePerLabel);
+
+        // Get the results with the highest confidence and map them to their labels
+        Collection<Recognition> results =
+                TensorFlowHelper.getBestResults(confidencePerLabel, mLabels);
+        // Report the results with the highest confidence
         onPhotoRecognitionReady(results);
     }
 
@@ -92,14 +140,26 @@ public class ImageClassifierActivity extends Activity {
      * Initialize the camera that will be used to capture images.
      */
     private void initCamera() {
-        // TODO: ADD CAMERA SUPPORT
+        mImagePreprocessor = new ImagePreprocessor(
+                PREVIEW_IMAGE_WIDTH, PREVIEW_IMAGE_HEIGHT,
+                TF_INPUT_IMAGE_WIDTH, TF_INPUT_IMAGE_HEIGHT);
+        mCameraHandler = CameraHandler.getInstance();
+        mCameraHandler.initializeCamera(this,
+                PREVIEW_IMAGE_WIDTH, PREVIEW_IMAGE_HEIGHT, null,
+                new ImageReader.OnImageAvailableListener() {
+                    @Override
+                    public void onImageAvailable(ImageReader imageReader) {
+                        Bitmap bitmap = mImagePreprocessor.preprocessImage(imageReader.acquireNextImage());
+                        onPhotoReady(bitmap);
+                    }
+                });
     }
 
     /**
      * Clean up resources used by the camera.
      */
     private void closeCamera() {
-        // TODO: ADD CAMERA SUPPORT
+        mCameraHandler.shutDown();
     }
 
     /**
@@ -107,9 +167,7 @@ public class ImageClassifierActivity extends Activity {
      * When done, the method {@link #onPhotoReady(Bitmap)} must be called with the image.
      */
     private void loadPhoto() {
-        // TODO: ADD CAMERA SUPPORT
-        Bitmap bitmap = getStaticBitmap();
-        onPhotoReady(bitmap);
+        mCameraHandler.takePicture();
     }
 
 
@@ -127,12 +185,104 @@ public class ImageClassifierActivity extends Activity {
         mImage = findViewById(R.id.imageView);
         mResultText = findViewById(R.id.resultText);
 
+        Picasso.get().load("https://i.imgur.com/DvpvklR.png").into(mImage);
+        Picasso.get().setLoggingEnabled(true);
+        //mImage.setImageBitmap(getStaticBitmap());
+
         updateStatus(getString(R.string.initializing));
-        initCamera();
-        initClassifier();
-        initButton();
-        updateStatus(getString(R.string.help_message));
+
+        mSensorManager = (SensorManager) getSystemService(Context.SENSOR_SERVICE);
+
+        try {
+            mSensorDriver = RainbowHat.createSensorDriver();
+            mSensorDriver.registerTemperatureSensor();
+            mSensorDriver.registerPressureSensor();
+            mSensorManager.registerDynamicSensorCallback(mDynamicSensorCallback);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+
+        //initCamera();
+        //initClassifier();
+        //initButton();
+        //updateStatus(getString(R.string.help_message));
     }
+
+    private void updateDisplay() {
+        updateStatus(
+                String.format(
+                        Locale.US,
+                        "Good morning, Blackfoot.\n\n" +
+                                "Onboard Temperature: %.2f °C.\n" +
+                                "Barometric Pressure: %.2f hPa.\n",
+                                mTemperature,
+                                mPressure));
+    }
+
+    // Callback used when we register the BMP280 sensor driver with the system's SensorManager.
+    private SensorManager.DynamicSensorCallback mDynamicSensorCallback
+            = new SensorManager.DynamicSensorCallback() {
+        @Override
+        public void onDynamicSensorConnected(Sensor sensor) {
+            SensorEventListener listener;
+            switch (sensor.getType()) {
+                case Sensor.TYPE_AMBIENT_TEMPERATURE:
+                    listener = mTemperatureListener;
+                    break;
+                case Sensor.TYPE_PRESSURE:
+                    listener = mPressureListener;
+                    break;
+                default:
+                    Log.w(TAG, "Can't register unknown sensor type " + sensor.getType());
+                    return;
+            }
+            mSensorManager.registerListener(listener, sensor, SensorManager.SENSOR_DELAY_NORMAL);
+        }
+
+        @Override
+        public void onDynamicSensorDisconnected(Sensor sensor) {
+            super.onDynamicSensorDisconnected(sensor);
+            SensorEventListener listener;
+            switch (sensor.getType()) {
+                case Sensor.TYPE_AMBIENT_TEMPERATURE:
+                    listener = mTemperatureListener;
+                    break;
+                case Sensor.TYPE_PRESSURE:
+                    listener = mPressureListener;
+                    break;
+                default:
+                    Log.w(TAG, "Can't unregister unknown sensor type " + sensor.getType());
+                    return;
+            }
+            mSensorManager.unregisterListener(listener, sensor);
+        }
+    };
+
+    private SensorEventListener mTemperatureListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            mTemperature = event.values[0];
+            updateDisplay();
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            Log.d(TAG, "accuracy changed: " + accuracy);
+        }
+    };
+
+    private SensorEventListener mPressureListener = new SensorEventListener() {
+        @Override
+        public void onSensorChanged(SensorEvent event) {
+            mPressure = event.values[0];
+            updateDisplay();
+        }
+
+        @Override
+        public void onAccuracyChanged(Sensor sensor, int accuracy) {
+            Log.d(TAG, "accuracy changed: " + accuracy);
+        }
+    };
 
     /**
      * Register a GPIO button that, when clicked, will generate the {@link KeyEvent#KEYCODE_ENTER}
@@ -152,8 +302,7 @@ public class ImageClassifierActivity extends Activity {
     }
 
     private Bitmap getStaticBitmap() {
-        Log.d(TAG, "Using sample photo in res/drawable/sampledog_224x224.png");
-        return BitmapFactory.decodeResource(this.getResources(), R.drawable.sampledog_224x224);
+        return BitmapFactory.decodeResource(this.getResources(), R.drawable.penguins);
     }
 
     @Override
@@ -216,7 +365,7 @@ public class ImageClassifierActivity extends Activity {
      * Report updates to the display and log output
      */
     private void updateStatus(String status) {
-        Log.d(TAG, status);
+        //Log.d(TAG, status);
         mResultText.setText(status);
     }
 
@@ -238,5 +387,12 @@ public class ImageClassifierActivity extends Activity {
         } catch (Throwable t) {
             // close quietly
         }
+        try {
+            if (mSensorDriver != null) mSensorDriver.close();
+        } catch (Throwable t) {
+            // close quietly
+        }
+        mSensorManager.unregisterDynamicSensorCallback(mDynamicSensorCallback);
+        mDynamicSensorCallback = null;
     }
 }
